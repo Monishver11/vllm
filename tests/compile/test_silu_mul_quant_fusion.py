@@ -174,27 +174,37 @@ class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
         return [torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant]
     
 class TestSiluMulBlockFp8QuantModelCUDA(torch.nn.Module):
-    """Test model for CUDA block FP8 quantization (non-AITER)"""
     def __init__(self, hidden_size: int, group_size: int = 128, **kwargs):
         super().__init__()
         self.silu_and_mul = SiluAndMul()
         self.group_size = group_size
         self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
         
-        # Import at init time, not forward time
-        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-            per_token_group_quant_fp8,
-        )
-        self.quant_fn = per_token_group_quant_fp8
+        # Get FP8 constants
+        self.fp8_dtype = FP8_DTYPE
+        finfo = torch.finfo(self.fp8_dtype)
+        self.fp8_min = finfo.min
+        self.fp8_max = finfo.max
         
     def forward(self, x):
         y = self.silu_and_mul(x)
-        result, scale = self.quant_fn(
-            y, 
-            group_size=self.group_size,
-            column_major_scales=False,
+        
+        # Allocate outputs
+        output_q = torch.empty(y.shape, device=y.device, dtype=self.fp8_dtype)
+        scale_shape = (y.shape[0], y.shape[1] // self.group_size)
+        output_s = torch.empty(scale_shape, device=y.device, dtype=torch.float32)
+        
+        # Call the op directly (no Python conditionals)
+        torch.ops._C.per_token_group_fp8_quant(
+            y, output_q, output_s, 
+            self.group_size, 
+            1e-10,  # eps
+            self.fp8_min, 
+            self.fp8_max, 
+            False   # scale_ue8m0
         )
-        return result, scale
+        
+        return output_q, output_s
     
     def ops_in_model_before(self):
         return [
