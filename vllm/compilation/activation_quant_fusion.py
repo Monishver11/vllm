@@ -216,17 +216,12 @@ class SiluMulBlockQuantPattern:
         )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        """Register pattern that matches silu_and_mul + per_token_group_fp8_quant."""
-        
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            # Match silu_and_mul custom op
             silu_mul_result = self.silu_and_mul_matcher(input)
-            # Match per_token_group_fp8_quant custom op
             result, scale = self.quant_matcher(silu_mul_result)
             return result, scale
         
         def replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            # Calculate output shape (input is 2x the output size)
             output_shape = list(input.shape)
             output_shape[-1] = output_shape[-1] // 2
             
@@ -236,7 +231,6 @@ class SiluMulBlockQuantPattern:
                 dtype=self.quant_dtype
             )
             
-            # Create scale tensor with correct shape
             scale_shape = (output_shape[0], output_shape[-1] // self.group_size)
             if self.has_col_major_scales:
                 scale = torch.empty(
@@ -263,17 +257,12 @@ class SiluMulBlockQuantPattern:
             
             return at[1], at[2]
         
-        # Use inputs from silu_and_mul_matcher (it expects 2x hidden size)
-        inputs = self.silu_and_mul_matcher.inputs()
-
-        print(f"=== Pattern debug for group_size={self.group_size}, col_major={self.has_col_major_scales}, e8m0={self.is_e8m0} ===")
-        print(f"Inputs: {inputs}")
-        try:
-            with torch.no_grad():
-                out = pattern(*inputs)
-                print(f"Pattern output: {out}")
-        except Exception as e:
-            print(f"Pattern execution failed: {e}")
+        # Input must be large enough: after silu_and_mul (halves), result must be divisible by group_size
+        input_size = self.group_size * 2  # e.g., 256 for group_size=128
+        inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
+        
+        # Trace the pattern before registering
+        pattern(*inputs)
         
         register_replacement(
             pattern,
