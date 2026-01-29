@@ -172,6 +172,33 @@ class TestSiluMulGroupFp8QuantModel(torch.nn.Module):
 
     def ops_in_model_after(self):
         return [torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant]
+    
+class TestSiluMulBlockFp8QuantModelCUDA(torch.nn.Module):
+    """Test model for CUDA block FP8 quantization (non-AITER)"""
+    def __init__(self, hidden_size: int, group_size: int = 128, **kwargs):
+        super().__init__()
+        self.silu_and_mul = SiluAndMul()
+        self.group_size = group_size
+        self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
+        
+    def forward(self, x):
+        from vllm.model_executor.layers.quantization.utils import fp8_utils
+        y = self.silu_and_mul(x)
+        result, scale = fp8_utils.per_token_group_quant_fp8(
+            y, 
+            group_size=self.group_size,
+            column_major_scales=False,
+        )
+        return result, scale
+    
+    def ops_in_model_before(self):
+        return [
+            SILU_MUL_OP if self.enable_silu_mul_custom_op else torch.ops.aten.mul,
+            torch.ops._C.per_token_group_fp8_quant.default,
+        ]
+    
+    def ops_in_model_after(self):
+        return [torch.ops._C.silu_and_mul_per_block_quant.default]
 
 
 ROCM_KERNELS = [ROCmFP8ScaledMMLinearKernel, PerTensorTorchFP8ScaledMMLinearKernel]
@@ -193,6 +220,7 @@ TEST_KERNELS = ROCM_KERNELS if current_platform.is_rocm() else CUDA_KERNELS
     + [
         (TestSiluMulNvfp4QuantModel, False, None),
         (TestSiluMulGroupFp8QuantModel, False, None),
+        (TestSiluMulBlockFp8QuantModelCUDA, False, None),
     ],
 )
 @pytest.mark.skipif(
@@ -215,6 +243,8 @@ def test_fusion_silu_and_mul_quant(
         pytest.skip("NVFP4 is not supported on this GPU.")
     if model_class is TestSiluMulGroupFp8QuantModel and not IS_AITER_FOUND:
         pytest.skip("AITER is not supported on this GPU.")
+    if model_class is TestSiluMulBlockFp8QuantModelCUDA and not current_platform.is_cuda():
+        pytest.skip("CUDA block FP8 test only runs on CUDA.")
 
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
