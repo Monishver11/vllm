@@ -68,6 +68,7 @@ if current_platform.is_cuda():
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
 
+print(QUANT_OPS)
 
 class FusedRMSQuantKey(NamedTuple):
     """
