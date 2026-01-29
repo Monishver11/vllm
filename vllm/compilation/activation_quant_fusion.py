@@ -265,6 +265,15 @@ class SiluMulBlockQuantPattern:
         
         # Use inputs from silu_and_mul_matcher (it expects 2x hidden size)
         inputs = self.silu_and_mul_matcher.inputs()
+
+        print(f"=== Pattern debug for group_size={self.group_size}, col_major={self.has_col_major_scales}, e8m0={self.is_e8m0} ===")
+        print(f"Inputs: {inputs}")
+        try:
+            with torch.no_grad():
+                out = pattern(*inputs)
+                print(f"Pattern output: {out}")
+        except Exception as e:
+            print(f"Pattern execution failed: {e}")
         
         register_replacement(
             pattern,
