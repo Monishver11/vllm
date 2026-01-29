@@ -312,8 +312,15 @@ class ActivationQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.Graph) -> None:
+        for node in graph.nodes:
+            if node.op == "call_function":
+                print(f"Op: {node.target}, args: {node.args}")
+        print("=== Graph before fusion ===")
+        graph.print_tabular()
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
+        print("=== Graph after fusion ===")
+        graph.print_tabular()
 
     def uuid(self) -> str:
         return VllmInductorPass.hash_source(
