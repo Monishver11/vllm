@@ -181,10 +181,15 @@ class TestSiluMulBlockFp8QuantModelCUDA(torch.nn.Module):
         self.group_size = group_size
         self.enable_silu_mul_custom_op = self.silu_and_mul.enabled()
         
+        # Import at init time, not forward time
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+        )
+        self.quant_fn = per_token_group_quant_fp8
+        
     def forward(self, x):
-        from vllm.model_executor.layers.quantization.utils import fp8_utils
         y = self.silu_and_mul(x)
-        result, scale = fp8_utils.per_token_group_quant_fp8(
+        result, scale = self.quant_fn(
             y, 
             group_size=self.group_size,
             column_major_scales=False,
@@ -293,6 +298,8 @@ def test_fusion_silu_and_mul_quant(
         elif model_class == TestSiluMulNvfp4QuantModel:
             atol, rtol = 1e-1, 1e-1
         elif model_class == TestSiluMulGroupFp8QuantModel:
+            atol, rtol = 5e-2, 5e-2
+        elif model_class == TestSiluMulBlockFp8QuantModelCUDA:  # ADD THIS
             atol, rtol = 5e-2, 5e-2
 
         torch.testing.assert_close(
