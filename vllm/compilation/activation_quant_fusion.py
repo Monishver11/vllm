@@ -216,19 +216,6 @@ class SiluMulBlockQuantPattern:
         )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        input_size = self.group_size * 2
-        test_input = torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")
-        
-        # Step 1: Test silu_and_mul_matcher
-        print(f"\n=== DEBUG group_size={self.group_size}, e8m0={self.is_e8m0} ===")
-        silu_out = self.silu_and_mul_matcher(test_input)
-        print(f"silu_and_mul output shape: {silu_out.shape}")
-        
-        # Step 2: Test quant_matcher  
-        quant_out, scale_out = self.quant_matcher(silu_out)
-        print(f"quant output shape: {quant_out.shape}, scale shape: {scale_out.shape}")
-        print(f"quant_matcher.QUANT_OP: {self.quant_matcher.QUANT_OP}")
-
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             silu_mul_result = self.silu_and_mul_matcher(input)
             result, scale = self.quant_matcher(silu_mul_result)
@@ -271,26 +258,19 @@ class SiluMulBlockQuantPattern:
             return at[1], at[2]
         
         # Trace the pattern before registering
-        inputs = [test_input]
-
+        input_size = self.group_size * 2
+        inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
+        
+        # Debug: Print what we're registering
         if self.group_size == 128 and not self.has_col_major_scales and not self.is_e8m0:
-            print("\n=== DETAILED DEBUG for group_size=128, col_major=False, e8m0=False ===")
+            print(f"\n=== Registering pattern: group_size={self.group_size}, col_major={self.has_col_major_scales}, e8m0={self.is_e8m0} ===")
+            print(f"Input shape for pattern: {inputs[0].shape}")
+            print(f"QUANT_OP: {self.quant_matcher.QUANT_OP}")
             
-            # Trace the pattern using torch.fx
-            from torch.fx import symbolic_trace
-            
-            # Can't directly trace due to custom ops, but we can use make_fx
-            from torch._functorch.make_functional import make_fx
-            from torch._subclasses.fake_tensor import FakeTensorMode
-            
-            try:
-                with FakeTensorMode():
-                    fake_input = torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")
-                    traced = make_fx(pattern)(fake_input)
-                    print("Pattern traced graph:")
-                    traced.graph.print_tabular()
-            except Exception as e:
-                print(f"Tracing failed: {e}")
+            # Execute pattern to see what it produces
+            out = pattern(*inputs)
+            print(f"Pattern output types: {type(out)}, {type(out[0])}, {type(out[1])}")
+            print(f"Pattern output shapes: {out[0].shape}, {out[1].shape}")
 
         pattern(*inputs)
         
@@ -345,13 +325,17 @@ class ActivationQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.Graph) -> None:
-        import torch._inductor.pattern_matcher as pm
-        old_debug = getattr(pm, 'PATTERN_MATCHER_DEBUG', False)
-        pm.PATTERN_MATCHER_DEBUG = True
+        import os
+        os.environ["TORCHINDUCTOR_PATTERN_MATCH_DEBUG"] = "1"
+        
+        print(f"\n=== Pattern matcher debug ===")
+        print(f"Graph nodes before matching:")
+        for node in graph.nodes:
+            if node.op == "call_function":
+                print(f"  {node.target} kwargs={list(node.kwargs.keys())}")
         
         self.matched_count = self.patterns.apply(graph)
-        
-        pm.PATTERN_MATCHER_DEBUG = False
+        logger.debug("Replaced %s patterns", self.matched_count)
         print(f"Matched count: {self.matched_count}")
 
     def uuid(self) -> str:
