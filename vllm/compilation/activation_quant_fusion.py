@@ -216,6 +216,19 @@ class SiluMulBlockQuantPattern:
         )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        input_size = self.group_size * 2
+        test_input = torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")
+        
+        # Step 1: Test silu_and_mul_matcher
+        print(f"\n=== DEBUG group_size={self.group_size}, e8m0={self.is_e8m0} ===")
+        silu_out = self.silu_and_mul_matcher(test_input)
+        print(f"silu_and_mul output shape: {silu_out.shape}")
+        
+        # Step 2: Test quant_matcher  
+        quant_out, scale_out = self.quant_matcher(silu_out)
+        print(f"quant output shape: {quant_out.shape}, scale shape: {scale_out.shape}")
+        print(f"quant_matcher.QUANT_OP: {self.quant_matcher.QUANT_OP}")
+
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             silu_mul_result = self.silu_and_mul_matcher(input)
             result, scale = self.quant_matcher(silu_mul_result)
@@ -257,11 +270,8 @@ class SiluMulBlockQuantPattern:
             
             return at[1], at[2]
         
-        # Input must be large enough: after silu_and_mul (halves), result must be divisible by group_size
-        input_size = self.group_size * 2  # e.g., 256 for group_size=128
-        inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
-        
         # Trace the pattern before registering
+        inputs = [test_input]
         pattern(*inputs)
         
         register_replacement(
