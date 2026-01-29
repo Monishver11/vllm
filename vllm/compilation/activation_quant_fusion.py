@@ -177,13 +177,11 @@ class SiluMulNvfp4QuantPattern(ActivationQuantPattern):
 
 class SiluMulBlockQuantPattern:
     """
-    Pattern for fusing inline SiLU+Mul with block quantization.
+    Pattern for fusing SiLU+Mul with block quantization.
     
     Matches:
-        gate, up = split(input, dim=-1)
-        silu = sigmoid(gate) * gate  # Inline SiLU
-        result = silu * up
-        quantize(result)
+        silu_and_mul(input)  # Custom op
+        per_token_group_fp8_quant(result)  # Custom op
     Into:
         silu_and_mul_per_block_quant(input, group_size)
     """
@@ -205,11 +203,10 @@ class SiluMulBlockQuantPattern:
         self.is_e8m0 = is_e8m0
         self.quant_dtype = FP8_DTYPE
         
-        from vllm.config import get_current_vllm_config
-        config = get_current_vllm_config()
-        self.model_dtype = config.model_config.dtype if config.model_config else None
+        # Use matcher for silu_and_mul custom op
+        self.silu_and_mul_matcher = MatcherSiluAndMul()
         
-        # Create quant matcher
+        # Create quant matcher for per_token_group_fp8_quant
         scale = ScaleDesc(torch.float32, False, group_shape)
         quant_key = QuantKey(dtype=FP8_DTYPE, scale=scale, symmetric=True)
         self.quant_matcher = MatcherQuantFP8(
@@ -219,20 +216,17 @@ class SiluMulBlockQuantPattern:
         )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        """Register pattern that matches inline SiLU+Mul operations."""
+        """Register pattern that matches silu_and_mul + per_token_group_fp8_quant."""
         
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            hidden = input.shape[-1] // 2
-            gate, up = input.split(hidden, dim=-1)
-            silu = torch.sigmoid(gate) * gate
-            silu_out = silu * up
-            result, scale = self.quant_matcher(silu_out)
+            # Match silu_and_mul custom op
+            silu_mul_result = self.silu_and_mul_matcher(input)
+            # Match per_token_group_fp8_quant custom op
+            result, scale = self.quant_matcher(silu_mul_result)
             return result, scale
         
-        def replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:            
-            if self.model_dtype is not None:
-                input = input.to(dtype=self.model_dtype)
-            
+        def replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # Calculate output shape (input is 2x the output size)
             output_shape = list(input.shape)
             output_shape[-1] = output_shape[-1] // 2
             
@@ -242,10 +236,20 @@ class SiluMulBlockQuantPattern:
                 dtype=self.quant_dtype
             )
             
-            scale = self.quant_matcher.make_scale(
-                torch.empty(output_shape, device=input.device),
-                transposed=self.has_col_major_scales
-            )
+            # Create scale tensor with correct shape
+            scale_shape = (output_shape[0], output_shape[-1] // self.group_size)
+            if self.has_col_major_scales:
+                scale = torch.empty(
+                    (scale_shape[1], scale_shape[0]), 
+                    device=input.device, 
+                    dtype=torch.float32
+                ).t()
+            else:
+                scale = torch.empty(
+                    scale_shape, 
+                    device=input.device, 
+                    dtype=torch.float32
+                )
             
             at = auto_functionalized(
                 torch.ops._C.silu_and_mul_per_block_quant.default,
@@ -259,12 +263,13 @@ class SiluMulBlockQuantPattern:
             
             return at[1], at[2]
         
-        input_example = torch.empty(5, 32, dtype=torch.float16, device="cuda")
+        # Use inputs from silu_and_mul_matcher (it expects 2x hidden size)
+        inputs = self.silu_and_mul_matcher.inputs()
         
         register_replacement(
             pattern,
             replacement,
-            [input_example],  # Example inputs
+            inputs,
             fwd_only,
             pm_pass,
         )
