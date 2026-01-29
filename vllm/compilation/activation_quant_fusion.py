@@ -272,6 +272,26 @@ class SiluMulBlockQuantPattern:
         
         # Trace the pattern before registering
         inputs = [test_input]
+
+        if self.group_size == 128 and not self.has_col_major_scales and not self.is_e8m0:
+            print("\n=== DETAILED DEBUG for group_size=128, col_major=False, e8m0=False ===")
+            
+            # Trace the pattern using torch.fx
+            from torch.fx import symbolic_trace
+            
+            # Can't directly trace due to custom ops, but we can use make_fx
+            from torch._functorch.make_functional import make_fx
+            from torch._subclasses.fake_tensor import FakeTensorMode
+            
+            try:
+                with FakeTensorMode():
+                    fake_input = torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")
+                    traced = make_fx(pattern)(fake_input)
+                    print("Pattern traced graph:")
+                    traced.graph.print_tabular()
+            except Exception as e:
+                print(f"Tracing failed: {e}")
+
         pattern(*inputs)
         
         register_replacement(
