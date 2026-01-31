@@ -9,57 +9,60 @@ torch._dynamo.config.suppress_errors = True
 
 def main():
     model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-    device = "cuda"
 
     print(f"Loading model: {model_name}")
 
     # --------------------------------
-    # 1. Build engine args (IMPORTANT)
+    # 1. Engine args (NO device param)
     # --------------------------------
     engine_args = EngineArgs(
         model=model_name,
         tokenizer=model_name,
         trust_remote_code=True,
         dtype="float16",
+
+        # turn off parallelism
         tensor_parallel_size=1,
         pipeline_parallel_size=1,
-        device=device,
+
+        # turn off distributed infra
+        worker_use_ray=False,
+        disable_custom_all_reduce=True,
+
         seed=42,
     )
 
     # --------------------------------
-    # 2. Create engine (initializes parallel state)
+    # 2. Build engine (sets everything up)
     # --------------------------------
     engine = LLMEngine.from_engine_args(engine_args)
 
     # --------------------------------
-    # 3. Get underlying HF model
+    # 3. Get raw HF model
     # --------------------------------
-    # This is where vLLM stores the actual nn.Module
     worker = engine.model_executor.driver_worker
-    model = worker.model.model   # <- HF Qwen2Model
+    model = worker.model.model   # Qwen2Model
 
     print("HF model type:", type(model))
 
 
     # --------------------------------
-    # 4. Access first transformer block MLP
+    # 4. Grab MLP
     # --------------------------------
-    layer0 = model.layers[0]
-    mlp = layer0.mlp
+    mlp = model.layers[0].mlp
 
     print("\nMLP:\n", mlp)
 
 
     # --------------------------------
-    # 5. TorchDynamo trace
+    # 5. Trace
     # --------------------------------
     hidden_size = model.config.hidden_size
 
     x = torch.randn(
         1,
         hidden_size,
-        device=device,
+        device="cuda",
         dtype=torch.float16,
     )
 
@@ -81,10 +84,10 @@ def main():
         compiled_mlp(x)
 
     if graphs:
-        print(f"\nCaptured {len(graphs)} graph(s):\n")
+        print("\nCaptured graph:\n")
         graphs[0].graph.print_tabular()
     else:
-        print("\n⚠️ No graph captured (fallback to eager).")
+        print("\n⚠️ No graph captured (fallback eager)")
 
 
 if __name__ == "__main__":
