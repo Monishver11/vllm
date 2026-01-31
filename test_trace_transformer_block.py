@@ -32,7 +32,7 @@ def main():
     # 2. Create engine
     # --------------------------------
     engine = LLMEngine.from_engine_args(engine_args)
-
+    print(dir(engine))
     # --------------------------------
     # 3. Get HF model
     # --------------------------------
