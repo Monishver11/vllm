@@ -180,18 +180,13 @@ class SiluMulBlockQuantPattern:
     Pattern for fusing SiLU+Mul with block quantization.
     
     Matches:
-        silu_and_mul(input)  # Custom op
-        per_token_group_fp8_quant(result)  # Custom op
+        silu_and_mul(input)
+        per_token_group_fp8_quant(result, ...)
     Into:
         silu_and_mul_per_block_quant(input, group_size)
     """
     
-    def __init__(
-        self, 
-        group_shape: GroupShape,
-        has_col_major_scales: bool = False,
-        is_e8m0: bool = False,
-    ):
+    def __init__(self, group_shape: GroupShape):
         assert group_shape[0] == 1, (
             f"SiluMulBlockQuantPattern only supports per-token quantization "
             f"(group_m=1), got group_shape={group_shape}"
@@ -199,21 +194,7 @@ class SiluMulBlockQuantPattern:
         
         self.group_shape = group_shape
         self.group_size = group_shape[1]
-        self.has_col_major_scales = has_col_major_scales
-        self.is_e8m0 = is_e8m0
         self.quant_dtype = FP8_DTYPE
-        
-        # Use matcher for silu_and_mul custom op
-        self.silu_and_mul_matcher = MatcherSiluAndMul()
-        
-        # Create quant matcher for per_token_group_fp8_quant
-        scale = ScaleDesc(torch.float32, False, group_shape)
-        quant_key = QuantKey(dtype=FP8_DTYPE, scale=scale, symmetric=True)
-        self.quant_matcher = MatcherQuantFP8(
-            quant_key, 
-            has_col_major_scales=has_col_major_scales,
-            is_e8m0=is_e8m0
-        )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
         group_size = self.group_size
@@ -222,18 +203,20 @@ class SiluMulBlockQuantPattern:
         finfo = torch.finfo(quant_dtype)
         fp8_min = finfo.min
         fp8_max = finfo.max
-        is_e8m0 = self.is_e8m0
         
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # Direct silu_and_mul call
             d = input.shape[-1] // 2
             out = torch.empty((*input.shape[:-1], d), dtype=input.dtype, device=input.device)
             torch.ops._C.silu_and_mul(out, input)
             
+            # Direct per_token_group_fp8_quant call
             x_q = torch.empty(out.shape, dtype=quant_dtype, device=out.device)
             scale_shape = (out.shape[0], out.shape[-1] // group_size)
             x_s = torch.empty(scale_shape, dtype=torch.float32, device=out.device)
+            # Use False for is_e8m0 in pattern - actual value will be extracted from matched graph
             torch.ops._C.per_token_group_fp8_quant(
-                out, x_q, x_s, group_size, 1e-10, fp8_min, fp8_max, is_e8m0
+                out, x_q, x_s, group_size, 1e-10, fp8_min, fp8_max, False
             )
             
             return x_q, x_s
@@ -245,18 +228,11 @@ class SiluMulBlockQuantPattern:
             result = torch.empty(output_shape, device=input.device, dtype=quant_dtype)
             
             scale_shape = (output_shape[0], output_shape[-1] // group_size)
-            if self.has_col_major_scales:
-                scale = torch.empty(
-                    (scale_shape[1], scale_shape[0]), 
-                    device=input.device, 
-                    dtype=torch.float32
-                ).t()
-            else:
-                scale = torch.empty(scale_shape, device=input.device, dtype=torch.float32)
+            scale = torch.empty(scale_shape, device=input.device, dtype=torch.float32)
             
-            # Call fused kernel
+            # Call fused kernel (is_scale_transposed=False for now)
             torch.ops._C.silu_and_mul_per_block_quant(
-                result, input, scale, group_size, None, self.has_col_major_scales
+                result, input, scale, group_size, None, False
             )
             
             return result, scale
@@ -264,32 +240,11 @@ class SiluMulBlockQuantPattern:
         input_size = group_size * 2
         inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
         
-        # DEBUG: Trace the pattern to see what ops it generates
-        if group_size == 128 and not self.has_col_major_scales and not self.is_e8m0:
-            print(f"\n=== DEBUG: Tracing pattern ===")
-            
-            graphs = []
-            def capture(gm, inps):
-                graphs.append(gm)
-                return gm
-            
-            compiled_pattern = torch.compile(pattern, backend=capture)
-            try:
-                compiled_pattern(*inputs)
-                print(f"Captured {len(graphs)} graph(s) from pattern")
-                for i, gm in enumerate(graphs):
-                    print(f"\n--- Pattern Graph {i+1} ---")
-                    for node in gm.graph.nodes:
-                        if node.op == "call_function":
-                            print(f"  {node.target}")
-            except Exception as e:
-                print(f"Pattern tracing failed: {e}")
-        
         try:
             pattern(*inputs)
             register_replacement(pattern, replacement, inputs, fwd_only, pm_pass)
         except Exception as e:
-            print(f"ERROR registering pattern group_size={group_size}, col_major={self.has_col_major_scales}, e8m0={is_e8m0}: {e}")
+            print(f"ERROR registering pattern group_size={group_size}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -322,18 +277,14 @@ class ActivationQuantFusionPass(VllmPatternMatcherPass):
         if current_platform.is_cuda():
             count = 0
             for group_shape in [GroupShape(1, 128), GroupShape(1, 64)]:
-                for has_col_major_scales in [True, False]:
-                    for is_e8m0 in [True, False]:
-                        pattern_silu_mul_block = SiluMulBlockQuantPattern(
-                            group_shape=group_shape,
-                            has_col_major_scales=has_col_major_scales,
-                            is_e8m0=is_e8m0,
-                        )
-                        pattern_silu_mul_block.register(self.patterns)
-                        count += 1
-                        print(f"  Registered pattern {count}: group_size={group_shape[1]}, col_major={has_col_major_scales}, e8m0={is_e8m0}")
+                pattern_silu_mul_block = SiluMulBlockQuantPattern(
+                    group_shape=group_shape,
+                )
+                pattern_silu_mul_block.register(self.patterns)
+                count += 1
+                print(f"  Registered pattern {count}: group_size={group_shape[1]}")
 
-        self.dump_patterns(config, self.patterns)
+                self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.Graph) -> None:
