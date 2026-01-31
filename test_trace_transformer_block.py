@@ -3,13 +3,15 @@ import torch._dynamo
 
 from vllm.config import (
     ModelConfig,
+    DeviceConfig,
     LoadConfig,
+    ParallelConfig,
+    VllmConfig,
 )
 from vllm.model_executor.model_loader import get_model_loader
 
-
+# Suppress Dynamo errors for a clean trace
 torch._dynamo.config.suppress_errors = True
-
 
 def main():
     model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -17,9 +19,9 @@ def main():
 
     print(f"Loading model: {model_name}")
 
-    # -------------------------
-    # 1. Model config
-    # -------------------------
+    # ---------------------------------------
+    # 1. Build configs
+    # ---------------------------------------
     model_config = ModelConfig(
         model=model_name,
         task="generate",
@@ -31,25 +33,36 @@ def main():
     )
 
     load_config = LoadConfig()
+    device_config = DeviceConfig(device=device)
+    parallel_config = ParallelConfig(1, 1, False)
 
-    # -------------------------
-    # 2. Load model (OLD API)
-    # -------------------------
+    # Build full vLLM config
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        load_config=load_config,
+        device_config=device_config,
+        parallel_config=parallel_config,
+    )
+
+    # ---------------------------------------
+    # 2. Load model via loader
+    # ---------------------------------------
     loader = get_model_loader(load_config)
 
-    try:
-        model = loader.load_model(model_config)
-    except TypeError:
-        model = loader.load_model(load_config, model_config)
+    model = loader.load_model(
+        vllm_config=vllm_config,
+        model_config=model_config,
+    )
 
+    print(f"Model loaded: {type(model)}")
 
-
-    # -------------------------
+    # ---------------------------------------
     # 3. Unwrap HF model
-    # -------------------------
+    # ---------------------------------------
     if hasattr(model, "model"):
         hf_model = model.model
     else:
+        # Fallback deeper unwrap if needed
         hf_model = (
             model.llm_engine
                  .model_executor
@@ -60,51 +73,37 @@ def main():
 
     print(f"HF model type: {type(hf_model)}")
 
+    # ---------------------------------------
+    # 4. Access transformer MLP
+    # ---------------------------------------
+    first_layer = hf_model.layers[0]
+    mlp = first_layer.mlp
 
-    # -------------------------
-    # 4. Access first block MLP
-    # -------------------------
-    layer0 = hf_model.layers[0]
-    mlp = layer0.mlp
+    print("\nMLP module:\n", mlp)
 
-    print("\nMLP module:\n")
-    print(mlp)
-
-
-    # -------------------------
-    # 5. Trace with Dynamo
-    # -------------------------
+    # ---------------------------------------
+    # 5. Trace the MLP with torch.compile
+    # ---------------------------------------
     hidden_size = hf_model.config.hidden_size
-
-    x = torch.randn(
-        1,
-        hidden_size,
-        device=device,
-        dtype=torch.float16,
-    )
+    x = torch.randn(1, hidden_size, dtype=torch.float16, device=device)
 
     graphs = []
-
     def capture_graph(gm, inputs):
         graphs.append(gm)
         return gm
 
     print("\nTracing MLP...")
 
-    compiled_mlp = torch.compile(
-        mlp,
-        backend=capture_graph,
-        fullgraph=False,
-    )
+    compiled_mlp = torch.compile(mlp, backend=capture_graph, fullgraph=False)
 
     with torch.no_grad():
         compiled_mlp(x)
 
     if graphs:
-        print(f"\nCaptured {len(graphs)} graph(s)\n")
+        print(f"\nCaptured {len(graphs)} graph(s):")
         graphs[0].graph.print_tabular()
     else:
-        print("\n⚠️ No graph captured (fallback to eager)")
+        print("\n⚠️ No graphs captured (Dynamo fallback).")
 
 
 if __name__ == "__main__":
