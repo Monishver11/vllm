@@ -37,10 +37,11 @@ def main():
     # -------------------------
     loader = get_model_loader(load_config)
 
-    # ✅ ONLY model_config allowed in your version
-    model = loader.load_model(model_config)
+    try:
+        model = loader.load_model(model_config)
+    except TypeError:
+        model = loader.load_model(load_config, model_config)
 
-    print(f"Model loaded: {type(model)}")
 
 
     # -------------------------
