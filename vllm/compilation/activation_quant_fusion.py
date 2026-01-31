@@ -216,22 +216,37 @@ class SiluMulBlockQuantPattern:
         )
     
     def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            silu_mul_result = self.silu_and_mul_matcher(input)
-            result, scale = self.quant_matcher(silu_mul_result)
-            return result, scale
+        group_size = self.group_size
+        quant_dtype = self.quant_dtype
         
-        def replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            output_shape = list(input.shape)
-            output_shape[-1] = output_shape[-1] // 2
+        finfo = torch.finfo(quant_dtype)
+        fp8_min = finfo.min
+        fp8_max = finfo.max
+        is_e8m0 = self.is_e8m0
+        
+        def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # Direct silu_and_mul call (matches the real graph)
+            d = input.shape[-1] // 2
+            out = torch.empty((*input.shape[:-1], d), dtype=input.dtype, device=input.device)
+            torch.ops._C.silu_and_mul(out, input)
             
-            result = torch.empty(
-                output_shape, 
-                device=input.device, 
-                dtype=self.quant_dtype
+            # Direct per_token_group_fp8_quant call (matches the real graph)
+            x_q = torch.empty(out.shape, dtype=quant_dtype, device=out.device)
+            scale_shape = (out.shape[0], out.shape[-1] // group_size)
+            x_s = torch.empty(scale_shape, dtype=torch.float32, device=out.device)
+            torch.ops._C.per_token_group_fp8_quant(
+                out, x_q, x_s, group_size, 1e-10, fp8_min, fp8_max, is_e8m0
             )
             
-            scale_shape = (output_shape[0], output_shape[-1] // self.group_size)
+            return x_q, x_s
+        
+        def replacement(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            d = input.shape[-1] // 2
+            output_shape = (*input.shape[:-1], d)
+            
+            result = torch.empty(output_shape, device=input.device, dtype=quant_dtype)
+            
+            scale_shape = (output_shape[0], output_shape[-1] // group_size)
             if self.has_col_major_scales:
                 scale = torch.empty(
                     (scale_shape[1], scale_shape[0]), 
@@ -239,48 +254,23 @@ class SiluMulBlockQuantPattern:
                     dtype=torch.float32
                 ).t()
             else:
-                scale = torch.empty(
-                    scale_shape, 
-                    device=input.device, 
-                    dtype=torch.float32
-                )
+                scale = torch.empty(scale_shape, device=input.device, dtype=torch.float32)
             
-            at = auto_functionalized(
-                torch.ops._C.silu_and_mul_per_block_quant.default,
-                result=result,
-                input=input,
-                scale=scale,
-                group_size=self.group_size,
-                scale_ub=None,
-                is_scale_transposed=self.has_col_major_scales,
+            # Call fused kernel
+            torch.ops._C.silu_and_mul_per_block_quant(
+                result, input, scale, group_size, None, self.has_col_major_scales
             )
             
-            return at[1], at[2]
+            return result, scale
         
-        # Trace the pattern before registering
-        input_size = self.group_size * 2
+        # Input size must work with group_size
+        input_size = group_size * 2  # After silu_and_mul, output is group_size
         inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
         
-        # Debug: Print what we're registering
-        if self.group_size == 128 and not self.has_col_major_scales and not self.is_e8m0:
-            print(f"\n=== Registering pattern: group_size={self.group_size}, col_major={self.has_col_major_scales}, e8m0={self.is_e8m0} ===")
-            print(f"Input shape for pattern: {inputs[0].shape}")
-            print(f"QUANT_OP: {self.quant_matcher.QUANT_OP}")
-            
-            # Execute pattern to see what it produces
-            out = pattern(*inputs)
-            print(f"Pattern output types: {type(out)}, {type(out[0])}, {type(out[1])}")
-            print(f"Pattern output shapes: {out[0].shape}, {out[1].shape}")
-
+        # Trace pattern before registering
         pattern(*inputs)
         
-        register_replacement(
-            pattern,
-            replacement,
-            inputs,
-            fwd_only,
-            pm_pass,
-        )
+        register_replacement(pattern, replacement, inputs, fwd_only, pm_pass)
         
 class ActivationQuantFusionPass(VllmPatternMatcherPass):
     """
