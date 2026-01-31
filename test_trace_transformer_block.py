@@ -3,14 +3,11 @@ import torch._dynamo
 
 from vllm.config import (
     ModelConfig,
-    DeviceConfig,
     LoadConfig,
-    ParallelConfig,
 )
 from vllm.model_executor.model_loader import get_model_loader
 
 
-# Cleaner tracing (avoid crashing on graph breaks)
 torch._dynamo.config.suppress_errors = True
 
 
@@ -21,7 +18,7 @@ def main():
     print(f"Loading model: {model_name}")
 
     # -------------------------
-    # 1. Setup configs
+    # 1. Model config
     # -------------------------
     model_config = ModelConfig(
         model=model_name,
@@ -33,53 +30,25 @@ def main():
         seed=42,
     )
 
-    # Needed internally by vLLM
-    parallel_config = ParallelConfig(
-        tensor_parallel_size=1,
-        pipeline_parallel_size=1,
-        enable_async_output=False,
-    )
-
     load_config = LoadConfig()
 
-    # NOTE: we DO NOT pass DeviceConfig to load_model (older versions break)
-    # device is handled internally by vLLM
-
-
     # -------------------------
-    # 2. Load model
+    # 2. Load model (OLD API)
     # -------------------------
     loader = get_model_loader(load_config)
 
-    try:
-        # Most versions
-        model = loader.load_model(
-            model_config=model_config,
-            parallel_config=parallel_config,
-        )
-    except TypeError:
-        # Some versions want these explicitly
-        model = loader.load_model(
-            model_config=model_config,
-            parallel_config=parallel_config,
-            vision_language_config=None,
-            lora_config=None,
-        )
+    # ✅ ONLY model_config allowed in your version
+    model = loader.load_model(model_config)
 
     print(f"Model loaded: {type(model)}")
 
 
     # -------------------------
-    # 3. Unwrap model safely
+    # 3. Unwrap HF model
     # -------------------------
-    # vLLM wraps the HF model differently by version
-
     if hasattr(model, "model"):
         hf_model = model.model
-    elif hasattr(model, "layers"):
-        hf_model = model
     else:
-        # Deep wrapper path (older vLLM)
         hf_model = (
             model.llm_engine
                  .model_executor
@@ -92,17 +61,17 @@ def main():
 
 
     # -------------------------
-    # 4. Grab transformer MLP
+    # 4. Access first block MLP
     # -------------------------
     layer0 = hf_model.layers[0]
     mlp = layer0.mlp
 
-    print("\nMLP module:")
+    print("\nMLP module:\n")
     print(mlp)
 
 
     # -------------------------
-    # 5. Prepare input
+    # 5. Trace with Dynamo
     # -------------------------
     hidden_size = hf_model.config.hidden_size
 
@@ -113,10 +82,6 @@ def main():
         dtype=torch.float16,
     )
 
-
-    # -------------------------
-    # 6. Capture TorchDynamo graph
-    # -------------------------
     graphs = []
 
     def capture_graph(gm, inputs):
@@ -135,10 +100,10 @@ def main():
         compiled_mlp(x)
 
     if graphs:
-        print(f"\nCaptured {len(graphs)} graph(s):\n")
+        print(f"\nCaptured {len(graphs)} graph(s)\n")
         graphs[0].graph.print_tabular()
     else:
-        print("\n⚠️ No graph captured (Dynamo fallback).")
+        print("\n⚠️ No graph captured (fallback to eager)")
 
 
 if __name__ == "__main__":
