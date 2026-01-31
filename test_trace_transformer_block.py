@@ -37,7 +37,7 @@ def main():
     # 3. Get HF model
     # --------------------------------
     worker = engine.model_executor.driver_worker
-    model = worker.model.model   # Qwen2Model
+    model = worker.model_runner.model   # Qwen2Model
 
     print("HF model:", type(model))
 
