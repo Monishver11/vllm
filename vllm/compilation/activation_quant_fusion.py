@@ -285,8 +285,14 @@ class SiluMulBlockQuantPattern:
             except Exception as e:
                 print(f"Pattern tracing failed: {e}")
         
-        pattern(*inputs)
-        register_replacement(pattern, replacement, inputs, fwd_only, pm_pass)
+        try:
+            pattern(*inputs)
+            register_replacement(pattern, replacement, inputs, fwd_only, pm_pass)
+        except Exception as e:
+            print(f"ERROR registering pattern group_size={group_size}, col_major={self.has_col_major_scales}, e8m0={is_e8m0}: {e}")
+            import traceback
+            traceback.print_exc()
+
         
 class ActivationQuantFusionPass(VllmPatternMatcherPass):
     """
