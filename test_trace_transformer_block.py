@@ -36,7 +36,9 @@ def main():
     # --------------------------------
     # 3. Get HF model
     # --------------------------------
-    model = engine.model_executor.driver_worker.worker.model_runner.model
+    worker = engine.engine_core.driver_worker.worker
+    model_runner = worker.model_runner
+    model = model_runner.model
 
     print("HF model:", type(model))
 
