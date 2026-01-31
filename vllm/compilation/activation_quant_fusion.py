@@ -225,12 +225,10 @@ class SiluMulBlockQuantPattern:
         is_e8m0 = self.is_e8m0
         
         def pattern(input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            # Direct silu_and_mul call (matches the real graph)
             d = input.shape[-1] // 2
             out = torch.empty((*input.shape[:-1], d), dtype=input.dtype, device=input.device)
             torch.ops._C.silu_and_mul(out, input)
             
-            # Direct per_token_group_fp8_quant call (matches the real graph)
             x_q = torch.empty(out.shape, dtype=quant_dtype, device=out.device)
             scale_shape = (out.shape[0], out.shape[-1] // group_size)
             x_s = torch.empty(scale_shape, dtype=torch.float32, device=out.device)
@@ -263,13 +261,31 @@ class SiluMulBlockQuantPattern:
             
             return result, scale
         
-        # Input size must work with group_size
-        input_size = group_size * 2  # After silu_and_mul, output is group_size
+        input_size = group_size * 2
         inputs = [torch.empty(5, input_size, dtype=torch.bfloat16, device="cuda")]
         
-        # Trace pattern before registering
-        pattern(*inputs)
+        # DEBUG: Trace the pattern to see what ops it generates
+        if group_size == 128 and not self.has_col_major_scales and not self.is_e8m0:
+            print(f"\n=== DEBUG: Tracing pattern ===")
+            
+            graphs = []
+            def capture(gm, inps):
+                graphs.append(gm)
+                return gm
+            
+            compiled_pattern = torch.compile(pattern, backend=capture)
+            try:
+                compiled_pattern(*inputs)
+                print(f"Captured {len(graphs)} graph(s) from pattern")
+                for i, gm in enumerate(graphs):
+                    print(f"\n--- Pattern Graph {i+1} ---")
+                    for node in gm.graph.nodes:
+                        if node.op == "call_function":
+                            print(f"  {node.target}")
+            except Exception as e:
+                print(f"Pattern tracing failed: {e}")
         
+        pattern(*inputs)
         register_replacement(pattern, replacement, inputs, fwd_only, pm_pass)
         
 class ActivationQuantFusionPass(VllmPatternMatcherPass):
